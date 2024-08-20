@@ -99,7 +99,7 @@ route _ (Message (GET, "/user-agent", _) headers _) = return $ case getHeader he
         Nothing -> badRequest
 
 route (Just staticDir) (Message (GET, '/' : 'f' : 'i' : 'l' : 'e' : 's' : '/' : filepath, _) _ _) = 
-    fileIO `catch` (\(_ :: IOException) -> return err401)
+    fileIO `catch` (\(_ :: IOException) -> return err404)
     where 
         fileIO = ((liftM respond) . BC.readFile $ staticDir <> filepath)
         respond content = B.concat [
