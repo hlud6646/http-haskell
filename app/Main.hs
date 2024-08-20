@@ -109,6 +109,10 @@ route (Just staticDir) (Message (GET, '/' : 'f' : 'i' : 'l' : 'e' : 's' : '/' : 
             content]
             where contentLength = BC.pack . show . B.length $ content
 
+route (Just staticDir) (Message (POST, '/' : 'f' : 'i' : 'l' : 'e' : 's' : '/' : filepath, _) _ body) = do
+    _ <- BC.writeFile (staticDir <> filepath) (BC.strip body)
+    return "HTTP/1.1 201 Created\r\n\r\n"
+
 route _ _ = return err404
 
 -- Simple lookup in a list of headers since we aren't allowed to use a Map?
