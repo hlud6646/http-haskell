@@ -15,33 +15,6 @@ import System.IO (BufferMode (..), hSetBuffering, stdout)
 import System.Environment
 import Control.Exception (catch, IOException)
 
-
-data Method = GET | POST | PATCH | DELETE
-    deriving (Eq, Show, Read)
-type Target = String -- Not ByteString since we will pattern match on this.
-type Version = BC.ByteString
-type Header = (BC.ByteString, BC.ByteString)
-type Body = BC.ByteString
-data Message = Message (Method, Target, Version) [Header] Body
-
--- Unfortunate that we are not permitted to use a parsing library here.
-parse :: BC.ByteString -> Maybe Message
-parse msg = do
-    let (reqString, rest) = B.breakSubstring "\r\n" msg
-        (headersLine, body) = B.breakSubstring "\r\n\r\n" (BC.strip rest)
-        headers = catMaybes . map parseHeader $ BC.split '\r' headersLine
-        parseHeader h = case B.split 58 h of -- fromEnum ':' == 58
-            [key, value] -> Just (BC.strip key, BC.strip value)
-            _ -> Nothing
-    (method, target, version) <- case  BC.split ' ' reqString of 
-        [method, target, version] ->  Just (read . BC.unpack $ method, BC.unpack target, version)
-        _ -> Nothing
-    return $ Message (method, target, version) headers body
-
-    
-
-
-
 main :: IO ()
 main = do
     args <- getArgs 
@@ -67,10 +40,16 @@ main = do
     let respond :: Socket -> IO ()
         respond client = do 
             msgString <- recv client 1024
-            res <- case parse msgString of 
-                Nothing -> return $ badRequest
-                Just msg -> route directory msg
-            sendAll client res
+            let req = parse msgString
+                encs = case req of 
+                    Nothing -> []
+                    Just r -> encodings r
+            res <- case req of
+                Nothing -> return err400' 
+                Just r -> route' directory r
+            if (Gzip `elem` encs)
+            then sendAll client (pack Gzip res)
+            else sendAll client (pack Id res)
 
     forever $ do
         (clientSocket, clientAddr) <- accept serverSocket
@@ -79,51 +58,114 @@ main = do
         return ()
 
 
-route :: Maybe String -> Message -> IO BC.ByteString
-route _ (Message (GET, "/", _) _ _) = return "HTTP/1.1 200 OK\r\n\r\n"
+data Method = GET | POST | PATCH | DELETE
+    deriving (Eq, Read)
+type Target = String -- Not ByteString since we will pattern match on this.
+type Version = BC.ByteString
+type StatusCode = BC.ByteString
+type StatusText = BC.ByteString
+type Header = (BC.ByteString, BC.ByteString)
+type Body = BC.ByteString
+data Request = Request (Method, Target, Version) [Header] Body
+data Response = Response (Version, StatusCode, StatusText) [Header] Body
+data Encoding = Gzip | MadeUpEncoding | Id
+    deriving (Read, Eq)
 
-route _ (Message (GET, '/' : 'e' : 'c' : 'h' : 'o' : '/' : text, _) _ _) = return $ BC.pack . concat $ [
-    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ", 
-    contentLength,
-    "\r\n\r\n",
-    text]
-    where contentLength = show . length $ text
 
-route _ (Message (GET, "/user-agent", _) headers _) = return $ case getHeader headers "User-Agent" of
-        Just userAgent -> B.concat [
-                           "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ",
-                           contentLength,
-                           "\r\n\r\n",
-                           BC.strip userAgent]
-            where contentLength = BC.pack . show . B.length . BC.strip $ userAgent
-        Nothing -> badRequest
+-- ------------------------------------------------------------------------------------------------
+-- Reading+Showing Requests+Responses.
 
-route (Just staticDir) (Message (GET, '/' : 'f' : 'i' : 'l' : 'e' : 's' : '/' : filepath, _) _ _) = 
-    fileIO `catch` (\(_ :: IOException) -> return err404)
+-- Unfortunate that we are not permitted to use a parsing library here.
+parse :: BC.ByteString -> Maybe Request
+parse msg = do
+    let (reqString, rest) = B.breakSubstring "\r\n" msg
+        (headersLine, body) = B.breakSubstring "\r\n\r\n" (BC.strip rest)
+        headers = catMaybes . map parseHeader $ BC.split '\r' headersLine
+        parseHeader h = case B.split 58 h of -- fromEnum ':' == 58
+            [key, value] -> Just (BC.strip key, BC.strip value)
+            _ -> Nothing
+    (method, target, version) <- case  BC.split ' ' reqString of 
+        [method, target, version] ->  Just (read . BC.unpack $ method, BC.unpack target, version)
+        _ -> Nothing
+    return $ Request (method, target, version) headers body
+    
+pack :: Encoding -> Response -> BC.ByteString
+pack Gzip (Response statusLine headers body) =
+    packStatusLine statusLine <> "\r\n" <>
+    packHeaders (("Content-Encoding", "gzip") : headers) <> "\r\n" <>
+    gzipBody where
+        gzipBody = body
+        
+pack _ (Response statusLine  headers body) = 
+    packStatusLine statusLine <> "\r\n" <>
+    packHeaders headers <> "\r\n" <>
+    body
+
+packStatusLine :: (Version, StatusCode, StatusText) -> BC.ByteString
+packStatusLine (version, statusCode, statusText) = BC.unwords [version, statusCode, statusText]
+
+packHeaders :: [Header] -> BC.ByteString
+packHeaders = BC.concat . (map (\(k, v) -> k <> ": " <> v <> "\r\n"))
+
+encodings :: Request -> [Encoding]
+encodings (Request _ headers _) = case getHeader headers "Accept-Encoding" of 
+    Nothing -> []
+    Just encs -> catMaybes (map readEnc $ (words . (filter (/= ',')) . BC.unpack) encs) where
+        readEnc "gzip" = Just Gzip
+        readEnc "madeUpEncoding" = Just MadeUpEncoding
+        readEnc _ = Nothing 
+-- ------------------------------------------------------------------------------------------------
+
+
+-- ------------------------------------------------------------------------------------------------
+-- Examples of server functionality.
+route' :: Maybe FilePath -> Request -> IO Response
+route' _ (Request (GET, "/", _) _ _) = return $ Response ok [] ""
+
+route' _ (Request (GET, '/' : 'e' : 'c' : 'h' : 'o' : '/' : text, _) _ _) = do
+    return $ Response ok headers (BC.pack text) where
+        headers = [ 
+            ("Content-Type", "text/plain"),
+            ("Content-Length", BC.pack . show . length $ text)]
+
+route' _ (Request (GET, "/user-agent", _) reqHeaders _) = 
+    return $ case getHeader reqHeaders "User-Agent" of
+        Just userAgent -> Response ok resHeaders userAgent where
+            resHeaders = [ 
+                ("Content-Type", "text/plain"),
+                ("Content-Length", BC.pack . show . BC.length $ userAgent)]
+        Nothing -> err400'
+
+route' (Just staticDir) (Request (GET, '/' : 'f' : 'i' : 'l' : 'e' : 's' : '/' : filepath, _) _ _) = 
+    fileIO `catch` (\(_ :: IOException) -> return err404')
     where 
         fileIO = ((liftM respond) . BC.readFile $ staticDir <> filepath)
-        respond content = B.concat [
-            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: ",
-            contentLength,
-            "\r\n\r\n",
-            content]
-            where contentLength = BC.pack . show . B.length $ content
+        respond content = Response ok headers content where
+            headers = [
+                ("Content-Type", "application/octet-stream"),
+                ("Content-Length", BC.pack . show . B.length $ content)]
 
-route (Just staticDir) (Message (POST, '/' : 'f' : 'i' : 'l' : 'e' : 's' : '/' : filepath, _) _ body) = do
+route' (Just staticDir) (Request (POST, '/' : 'f' : 'i' : 'l' : 'e' : 's' : '/' : filepath, _) _ body) = do
     _ <- BC.writeFile (staticDir <> filepath) (BC.strip body)
-    return "HTTP/1.1 201 Created\r\n\r\n"
+    return $ Response ("HTTP/1.1", "201", "Created") [] ""
 
-route _ _ = return err404
+route' _ _ = return $ err404'
+-- ------------------------------------------------------------------------------------------------
+
+
+
+-- ------------------------------------------------------------------------------------------------
+-- Utils
 
 -- Simple lookup in a list of headers since we aren't allowed to use a Map?
 getHeader :: [Header] -> BC.ByteString -> Maybe BC.ByteString
 getHeader headers key = (fmap snd) (find ((== key) . fst) headers)
 
-badRequest :: BC.ByteString
-badRequest = BC.pack "HTTP/1.1 400 Bad Request\r\n\r\n"
+err400' :: Response
+err400' = Response ("HTTP/1.1", "404", "Bad Request") [] ""
 
-err404 :: BC.ByteString
-err404 = BC.pack "HTTP/1.1 404 Not Found\r\n\r\n"
+err404' :: Response
+err404' = Response ("HTTP/1.1", "404", "Not Found") [] ""
 
-err401 :: BC.ByteString
-err401 = BC.pack "HTTP/1.1 401 Not Found\r\n\r\n"
+ok :: (Version, StatusCode, StatusText)
+ok = ("HTTP/1.1", "200", "OK")
