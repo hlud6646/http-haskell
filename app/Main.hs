@@ -5,20 +5,27 @@ module Main (main) where
 
 import Control.Monad (forever, liftM)
 import Data.List (find)
-import Data.Maybe (catMaybes)
+import Data.Maybe (catMaybes, mapMaybe)
 import Control.Concurrent (forkFinally)
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString as B
+import qualified Data.ByteString.Lazy as BL
 import Network.Socket
 import Network.Socket.ByteString
 import System.IO (BufferMode (..), hSetBuffering, stdout)
 import System.Environment
 import Control.Exception (catch, IOException)
 
+-- NOTE: To make this import work we have had to alter the pagkage.yaml 
+-- which starts with an angry DON'T EDIT THIS. What is the intention, 
+-- because surely to rewrite an entire compression library is out of 
+-- scope...
+import qualified Codec.Compression.GZip as GZip
+
 main :: IO ()
 main = do
-    args <- getArgs 
-    
+    args <- getArgs
+
     hSetBuffering stdout LineBuffering
 
     let host = "127.0.0.1"
@@ -27,27 +34,25 @@ main = do
         directory = case args of
             ["--directory", x] -> Just x
             _ -> Nothing
-    
+
     BC.putStrLn $ "Listening on " <> BC.pack host <> ":" <> BC.pack port
-    
+
     addrInfo <- getAddrInfo Nothing (Just host) (Just port)
-    
+
     serverSocket <- socket (addrFamily $ head addrInfo) Stream defaultProtocol
     setSocketOption serverSocket ReuseAddr 1
     bind serverSocket $ addrAddress $ head addrInfo
     listen serverSocket 5
-    
+
     let respond :: Socket -> IO ()
-        respond client = do 
+        respond client = do
             msgString <- recv client 1024
-            let req = parse msgString
-                encs = case req of 
-                    Nothing -> []
-                    Just r -> encodings r
+            let req  = parse msgString
+                encs = maybe [] encodings req
             res <- case req of
-                Nothing -> return err400' 
-                Just r -> route' directory r
-            if (Gzip `elem` encs)
+                Nothing -> return err400'
+                Just r  -> route' directory r
+            if Gzip `elem` encs
             then sendAll client (pack Gzip res)
             else sendAll client (pack Id res)
 
@@ -80,40 +85,45 @@ parse :: BC.ByteString -> Maybe Request
 parse msg = do
     let (reqString, rest) = B.breakSubstring "\r\n" msg
         (headersLine, body) = B.breakSubstring "\r\n\r\n" (BC.strip rest)
-        headers = catMaybes . map parseHeader $ BC.split '\r' headersLine
+        headers = mapMaybe parseHeader $ BC.split '\r' headersLine
         parseHeader h = case B.split 58 h of -- fromEnum ':' == 58
             [key, value] -> Just (BC.strip key, BC.strip value)
             _ -> Nothing
-    (method, target, version) <- case  BC.split ' ' reqString of 
+    (method, target, version) <- case  BC.split ' ' reqString of
         [method, target, version] ->  Just (read . BC.unpack $ method, BC.unpack target, version)
         _ -> Nothing
     return $ Request (method, target, version) headers body
-    
+
 pack :: Encoding -> Response -> BC.ByteString
 pack Gzip (Response statusLine headers body) =
     packStatusLine statusLine <> "\r\n" <>
-    packHeaders (("Content-Encoding", "gzip") : headers) <> "\r\n" <>
+    packHeaders headers' <> "\r\n" <>
     gzipBody where
-        gzipBody = body
-        
-pack _ (Response statusLine  headers body) = 
+        gzipBody = B.toStrict $  GZip.compress (BL.fromStrict body)
+        headers' = [
+            ("Content-Encoding", "gzip"),
+            ("Content-Length", BC.pack . show . B.length $ gzipBody)]
+            ++ headers
+
+pack _ (Response statusLine  headers body) =
     packStatusLine statusLine <> "\r\n" <>
-    packHeaders headers <> "\r\n" <>
-    body
+    packHeaders headers' <> "\r\n" <>
+    body where
+        headers' = ("Content-Length", BC.pack . show . B.length $ body) : headers
 
 packStatusLine :: (Version, StatusCode, StatusText) -> BC.ByteString
 packStatusLine (version, statusCode, statusText) = BC.unwords [version, statusCode, statusText]
 
 packHeaders :: [Header] -> BC.ByteString
-packHeaders = BC.concat . (map (\(k, v) -> k <> ": " <> v <> "\r\n"))
+packHeaders = BC.concat . map (\(k, v) -> k <> ": " <> v <> "\r\n")
 
 encodings :: Request -> [Encoding]
-encodings (Request _ headers _) = case getHeader headers "Accept-Encoding" of 
+encodings (Request _ headers _) = case getHeader headers "Accept-Encoding" of
     Nothing -> []
     Just encs -> catMaybes (map readEnc $ (words . (filter (/= ',')) . BC.unpack) encs) where
         readEnc "gzip" = Just Gzip
         readEnc "madeUpEncoding" = Just MadeUpEncoding
-        readEnc _ = Nothing 
+        readEnc _ = Nothing
 -- ------------------------------------------------------------------------------------------------
 
 
@@ -124,26 +134,26 @@ route' _ (Request (GET, "/", _) _ _) = return $ Response ok [] ""
 
 route' _ (Request (GET, '/' : 'e' : 'c' : 'h' : 'o' : '/' : text, _) _ _) = do
     return $ Response ok headers (BC.pack text) where
-        headers = [ 
-            ("Content-Type", "text/plain"),
-            ("Content-Length", BC.pack . show . length $ text)]
+        headers = [
+            ("Content-Type", "text/plain")]
+            -- ("Content-Length", BC.pack . show . length $ text)]
 
-route' _ (Request (GET, "/user-agent", _) reqHeaders _) = 
+route' _ (Request (GET, "/user-agent", _) reqHeaders _) =
     return $ case getHeader reqHeaders "User-Agent" of
         Just userAgent -> Response ok resHeaders userAgent where
-            resHeaders = [ 
-                ("Content-Type", "text/plain"),
-                ("Content-Length", BC.pack . show . BC.length $ userAgent)]
+            resHeaders = [
+                ("Content-Type", "text/plain")]
+                -- ("Content-Length", BC.pack . show . BC.length $ userAgent)]
         Nothing -> err400'
 
-route' (Just staticDir) (Request (GET, '/' : 'f' : 'i' : 'l' : 'e' : 's' : '/' : filepath, _) _ _) = 
+route' (Just staticDir) (Request (GET, '/' : 'f' : 'i' : 'l' : 'e' : 's' : '/' : filepath, _) _ _) =
     fileIO `catch` (\(_ :: IOException) -> return err404')
-    where 
-        fileIO = ((liftM respond) . BC.readFile $ staticDir <> filepath)
+    where
+        fileIO = (liftM respond) . BC.readFile $ staticDir <> filepath
         respond content = Response ok headers content where
             headers = [
-                ("Content-Type", "application/octet-stream"),
-                ("Content-Length", BC.pack . show . B.length $ content)]
+                ("Content-Type", "application/octet-stream")]
+                -- ("Content-Length", BC.pack . show . B.length $ content)]
 
 route' (Just staticDir) (Request (POST, '/' : 'f' : 'i' : 'l' : 'e' : 's' : '/' : filepath, _) _ body) = do
     _ <- BC.writeFile (staticDir <> filepath) (BC.strip body)
