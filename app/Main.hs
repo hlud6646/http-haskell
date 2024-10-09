@@ -3,10 +3,6 @@
 
 module Main (main) where
 
--- NOTE: To make this import work we have had to alter the pagkage.yaml
--- which starts with an angry DON'T EDIT THIS. What is the intention,
--- because surely to rewrite an entire compression library is out of
--- scope...
 import qualified Codec.Compression.GZip as GZip
 import Control.Concurrent (forkFinally)
 import Control.Exception (IOException, catch)
