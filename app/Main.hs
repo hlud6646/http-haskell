@@ -51,7 +51,7 @@ main = do
   setSocketOption serverSocket ReuseAddr 1
   bind serverSocket $ addrAddress $ head addrInfo
   listen serverSocket 5
-
+  -- TODO: handleClient would be a better name than 'respond'.
   let respond :: Socket -> IO ()
       respond client = do
         msgString <- recv client 1024
